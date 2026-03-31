@@ -128,13 +128,8 @@ Open [http://localhost:8080](http://localhost:8080)
 
 ---
 
-## ❤️ 赞助
-
-如果这个项目对你有帮助，欢迎请我喝杯咖啡 ☕
-
-你的支持是我持续更新、带来更好作品的动力，感谢每一位愿意赞助的朋友！
-
-<img src="assets/wechat-donate.png" width="200" alt="微信收款码" />
+## 来源
+https://github.com/heyuqiu2023/CodexPool
 
 ---
 
