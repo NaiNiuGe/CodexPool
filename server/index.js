@@ -20,6 +20,91 @@ const PROJECT_ACCOUNTS_DIR = path.join(PROJECT_ROOT, 'accounts');
 
 const execAsync = promisify(exec);
 
+function stripAnsi(text = '') {
+  return text.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+function shouldUseShellForBinary(command) {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+
+  return !path.isAbsolute(command) || /\.(cmd|bat)$/i.test(command);
+}
+
+function isWindowsStoreBinary(command) {
+  return /\\WindowsApps\\/i.test(command);
+}
+
+function getCodexCommandEnv() {
+  return { ...process.env, TERM: 'xterm' };
+}
+
+function formatCodexProbeSummary(failures) {
+  return failures
+    .map(({ command, reason }) => `${command}: ${reason}`)
+    .join('\n');
+}
+
+function getCodexUnavailableMessage(failures) {
+  if (
+    process.platform === 'win32' &&
+    failures.some(({ command, reason }) => isWindowsStoreBinary(command) || /access is denied|拒绝访问|eperm/i.test(reason))
+  ) {
+    return '未找到可执行的 Codex CLI。当前探测到的 Windows Store 版 codex.exe 在此环境下无法被后端调用，请安装可执行的 Codex CLI，或在设置中把 Codex 路径改成可运行的 codex.cmd/.bat/.exe。';
+  }
+
+  return '未找到可执行的 Codex CLI，请在设置中填写正确的 Codex 路径。';
+}
+
+async function probeCodexCandidate(command) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, ['--version'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: shouldUseShellForBinary(command),
+        windowsHide: true,
+        env: getCodexCommandEnv(),
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        reason: error.message,
+        output: '',
+        code: error.code || null,
+      });
+      return;
+    }
+
+    let output = '';
+    const appendOutput = (chunk) => {
+      output += stripAnsi(chunk.toString());
+    };
+
+    child.stdout.on('data', appendOutput);
+    child.stderr.on('data', appendOutput);
+
+    child.on('error', (error) => {
+      resolve({
+        ok: false,
+        reason: error.message,
+        output,
+        code: error.code || null,
+      });
+    });
+
+    child.on('exit', (code) => {
+      resolve({
+        ok: code === 0,
+        reason: code === 0 ? null : output.trim() || `exit ${code}`,
+        output,
+        code,
+      });
+    });
+  });
+}
+
 // ─────────────────────────────────────────────
 // 工具函数
 // ─────────────────────────────────────────────
@@ -51,6 +136,120 @@ function decodeJwtPayload(token) {
   } catch {
     return null;
   }
+}
+
+function getAuthIdentity(authData = {}) {
+  const accessToken = authData?.tokens?.access_token || authData?.access_token || authData?.accessToken || '';
+  const payload = accessToken ? decodeJwtPayload(accessToken) : null;
+  const profile = payload?.['https://api.openai.com/profile'];
+  const auth = payload?.['https://api.openai.com/auth'];
+
+  return {
+    accessToken,
+    payload,
+    email: String(payload?.email || profile?.email || authData?.email || '').trim().toLowerCase(),
+    accountId: String(auth?.chatgpt_account_id || authData?.account_id || '').trim(),
+    subject: String(payload?.sub || '').trim(),
+  };
+}
+
+function sanitizeAuthFilePart(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/@/g, '_at_')
+    .replace(/[^a-z0-9._-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 120);
+}
+
+function buildAuthStorageFileName(authData, fallbackName = 'auth.json') {
+  const identity = getAuthIdentity(authData);
+  const fallbackBase = path.basename(fallbackName, path.extname(fallbackName));
+  const preferredBase =
+    sanitizeAuthFilePart(identity.email) ||
+    sanitizeAuthFilePart(identity.accountId) ||
+    sanitizeAuthFilePart(identity.subject) ||
+    sanitizeAuthFilePart(fallbackBase);
+
+  const safeBase = preferredBase || `auth_${Date.now()}`;
+  return {
+    identity,
+    fileName: `${safeBase === 'auth' ? `auth_${Date.now()}` : safeBase}.json`,
+  };
+}
+
+function looksLikeAuthFile(authData = {}) {
+  const identity = getAuthIdentity(authData);
+  return Boolean(
+    identity.accessToken ||
+    authData?.tokens?.refresh_token ||
+    authData?.refresh_token ||
+    authData?.OPENAI_API_KEY
+  );
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function saveAuthFileToAccounts(authFilePath, originalFileName = path.basename(authFilePath)) {
+  const authData = JSON.parse(await fs.readFile(authFilePath, 'utf8'));
+  const { fileName, identity } = buildAuthStorageFileName(authData, originalFileName);
+  const dest = path.join(PROJECT_ACCOUNTS_DIR, fileName);
+
+  await fs.mkdir(PROJECT_ACCOUNTS_DIR, { recursive: true });
+  await fs.copyFile(authFilePath, dest);
+
+  return { fileName, dest, identity };
+}
+
+async function findLatestChangedAuthFile(codexDir, beforeFiles = new Set()) {
+  const afterFiles = await fs.readdir(codexDir);
+  const changedJsonFiles = [];
+
+  for (const file of afterFiles) {
+    if (!file.endsWith('.json')) continue;
+    const fullPath = path.join(codexDir, file);
+    const stat = await fs.stat(fullPath);
+    if (beforeFiles.has(`${file}::${stat.mtimeMs}`)) continue;
+
+    try {
+      const authData = JSON.parse(await fs.readFile(fullPath, 'utf8'));
+      if (!looksLikeAuthFile(authData) && file !== 'auth.json') continue;
+      changedJsonFiles.push({ fileName: file, fullPath, mtimeMs: stat.mtimeMs });
+    } catch {
+      if (file === 'auth.json') {
+        changedJsonFiles.push({ fileName: file, fullPath, mtimeMs: stat.mtimeMs });
+      }
+    }
+  }
+
+  changedJsonFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const authJson = changedJsonFiles.find(file => file.fileName === 'auth.json');
+  if (authJson) return authJson;
+  if (changedJsonFiles.length > 0) return changedJsonFiles[0];
+
+  const fallbackAuthPath = path.join(codexDir, 'auth.json');
+  if (await pathExists(fallbackAuthPath)) {
+    try {
+      const fallbackAuthData = JSON.parse(await fs.readFile(fallbackAuthPath, 'utf8'));
+      if (!looksLikeAuthFile(fallbackAuthData)) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    return { fileName: 'auth.json', fullPath: fallbackAuthPath, mtimeMs: 0 };
+  }
+
+  return null;
 }
 
 /**
@@ -653,14 +852,13 @@ app.get('/api/accounts/scan-dir', asyncHandler(async (req, res) => {
       const content = await fs.readFile(fullPath, 'utf8');
       const parsed = JSON.parse(content);
 
-      // 尝试从 access_token 解码邮箱和套餐信息
-      const token = parsed.access_token || parsed.accessToken || '';
-      const payload = decodeJwtPayload(token);
-      const email = payload?.email || payload?.['https://api.openai.com/profile']?.email || '';
+      // Try to derive a stable identity from the auth payload.
+      const identity = getAuthIdentity(parsed);
+      const email = identity.email;
 
       // 调 wham/usage 获取真实 plan_type（不消耗 token）
       let auth_type = 'plus';
-      const accessToken = parsed.tokens?.access_token || parsed.access_token || '';
+      const accessToken = identity.accessToken;
       if (accessToken) {
         try {
           const whamResp = await fetch('https://chatgpt.com/backend-api/wham/usage', {
@@ -675,8 +873,7 @@ app.get('/api/accounts/scan-dir', asyncHandler(async (req, res) => {
         } catch { /* 网络失败就用默认值 */ }
       }
 
-      // 账号名：去掉 .json 后缀
-      const suggestedName = file.replace(/\.json$/, '');
+      const suggestedName = buildAuthStorageFileName(parsed, file).fileName.replace(/\.json$/, '');
       results.push({
         file,
         full_path: fullPath,
@@ -945,12 +1142,93 @@ async function resolveCodexBin() {
   return 'codex'; // last resort — shell: true below will try PATH again
 }
 
+async function resolveCodexCommand() {
+  const [settingsRows] = await pool.query('SELECT codex_path FROM settings WHERE id = 1');
+  const fromSettings = (settingsRows[0]?.codex_path || '').trim();
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (command) => {
+    const normalized = String(command || '').trim();
+    if (!normalized) return;
+
+    const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    if (seen.has(key)) return;
+
+    seen.add(key);
+    candidates.push(normalized);
+  };
+
+  pushCandidate(fromSettings);
+
+  if (process.platform === 'win32') {
+    for (const lookupCommand of ['where.exe codex.cmd', 'where.exe codex.bat', 'where.exe codex.exe', 'where.exe codex']) {
+      try {
+        const { stdout } = await execAsync(lookupCommand);
+        stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .forEach(pushCandidate);
+      } catch { /* ignore missing command */ }
+    }
+  } else {
+    try {
+      const { stdout } = await execAsync('which codex || command -v codex');
+      stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .forEach(pushCandidate);
+    } catch { /* ignore missing command */ }
+  }
+
+  pushCandidate('codex');
+
+  const failures = [];
+  for (const candidate of candidates) {
+    if (path.isAbsolute(candidate)) {
+      try {
+        await fs.access(candidate);
+      } catch (error) {
+        failures.push({ command: candidate, reason: `路径不可访问: ${error.message}` });
+        continue;
+      }
+    }
+
+    const probe = await probeCodexCandidate(candidate);
+    if (probe.ok) {
+      return { ok: true, command: candidate };
+    }
+
+    failures.push({ command: candidate, reason: probe.reason || '无法执行' });
+  }
+
+  return {
+    ok: false,
+    message: getCodexUnavailableMessage(failures),
+    details: formatCodexProbeSummary(failures),
+  };
+}
+
 app.post('/api/auth/codex-login', asyncHandler(async (_req, res) => {
   if (loginProc) {
     return res.status(409).json({ message: '已有登录进程正在运行，请等待或取消' });
   }
 
-  const codexBin = await resolveCodexBin();
+  const resolvedCodex = await resolveCodexCommand();
+  if (!resolvedCodex.ok) {
+    loginSession = {
+      status: 'error',
+      message: resolvedCodex.message,
+      output: resolvedCodex.details,
+      newFile: null,
+      error: resolvedCodex.message,
+    };
+    return res.status(400).json({ message: resolvedCodex.message });
+  }
+
+  const codexBin = resolvedCodex.command;
 
   // Snapshot existing files in ~/.codex/ before login
   const codexDir = path.join(os.homedir(), '.codex');
@@ -966,14 +1244,26 @@ app.post('/api/auth/codex-login', asyncHandler(async (_req, res) => {
   loginSession = { status: 'running', message: '正在启动 codex login…', output: '', newFile: null, error: null };
 
   // shell: true → lets the OS shell search PATH, handles aliases & env properly
-  loginProc = spawn(codexBin, ['login'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    shell: true,
-    env: { ...process.env, TERM: 'xterm' },
-  });
+  try {
+    loginProc = spawn(codexBin, ['login'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: shouldUseShellForBinary(codexBin),
+      windowsHide: true,
+      env: getCodexCommandEnv(),
+    });
+  } catch (error) {
+    loginSession = {
+      status: 'error',
+      message: `无法启动 codex: ${error.message}`,
+      output: loginSession.output,
+      newFile: null,
+      error: error.message,
+    };
+    return res.status(400).json({ message: loginSession.message });
+  }
 
   const appendOutput = (chunk) => {
-    const text = chunk.toString().replace(/\x1b\[[0-9;]*m/g, ''); // strip ANSI colors
+    const text = stripAnsi(chunk.toString());
     loginSession.output += text;
     // Use last non-empty line as the status message
     const lines = loginSession.output.trim().split('\n').filter(Boolean);
@@ -998,30 +1288,16 @@ app.post('/api/auth/codex-login', asyncHandler(async (_req, res) => {
     // Find newly added or updated auth files in ~/.codex/
     try {
       await fs.mkdir(codexDir, { recursive: true });
-      const afterFiles = await fs.readdir(codexDir);
-      let newFile = null;
+      const latestAuthFile = await findLatestChangedAuthFile(codexDir, beforeFiles);
 
-      for (const f of afterFiles) {
-        if (!f.endsWith('.json')) continue;
-        const stat = await fs.stat(path.join(codexDir, f));
-        if (!beforeFiles.has(`${f}::${stat.mtimeMs}`)) {
-          newFile = f;
-          break;
-        }
-      }
-
-      if (newFile) {
-        await fs.mkdir(PROJECT_ACCOUNTS_DIR, { recursive: true });
-        const src = path.join(codexDir, newFile);
-        const dest = path.join(PROJECT_ACCOUNTS_DIR, newFile);
-        await fs.copyFile(src, dest);
-        loginSession = { status: 'success', message: `登录成功！已保存 ${newFile}`, output: loginSession.output, newFile, error: null };
+      if (latestAuthFile) {
+        const saved = await saveAuthFileToAccounts(latestAuthFile.fullPath, latestAuthFile.fileName);
+        loginSession = { status: 'success', message: `登录成功！已保存 ${saved.fileName}`, output: loginSession.output, newFile: saved.fileName, error: null };
       } else {
-        // auth.json may have been updated in-place (re-login)
-        loginSession = { status: 'success', message: '登录成功！请手动将 ~/.codex/auth.json 复制到 accounts/', output: loginSession.output, newFile: null, error: null };
+        loginSession = { status: 'success', message: '登录成功，但未找到可保存的 auth 文件', output: loginSession.output, newFile: null, error: 'auth_file_not_found' };
       }
     } catch (e) {
-      loginSession = { status: 'success', message: '登录成功（文件复制失败，请手动操作）', output: loginSession.output, newFile: null, error: e.message };
+      loginSession = { status: 'success', message: '登录成功，但保存 auth 文件失败', output: loginSession.output, newFile: null, error: e.message };
     }
   });
 

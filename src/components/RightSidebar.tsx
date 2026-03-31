@@ -105,7 +105,7 @@ export function RightSidebar({ settings, onSettingsChange, onRotateNow, onPauseA
             value={settings.codex_path}
             onChange={(e) => update({ codex_path: e.target.value })}
             className="h-7 text-xs bg-input border-border/50 font-mono"
-            placeholder="/usr/local/bin/codex"
+            placeholder="留空自动探测，或填写 codex.cmd / codex.exe"
           />
         </div>
       </div>

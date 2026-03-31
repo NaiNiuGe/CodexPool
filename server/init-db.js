@@ -13,8 +13,8 @@ function getAdminConnectionOptions() {
   }
 
   return {
-    host: config.db.host,
-    port: config.db.port,
+    host: config.db.host || '127.0.0.1',
+    port: config.db.port || 3306,
     user: config.db.user,
     password: config.db.password,
   };
@@ -106,19 +106,43 @@ async function createTables() {
   `);
 }
 
+async function createIndexIfMissing(tableName, indexName, columnsSql) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) AS count
+     FROM information_schema.statistics
+     WHERE table_schema = ?
+       AND table_name = ?
+       AND index_name = ?`,
+    [config.db.database, tableName, indexName],
+  );
+
+  if (rows[0].count > 0) {
+    return;
+  }
+
+  try {
+    await pool.query(`CREATE INDEX \`${indexName}\` ON \`${tableName}\` (${columnsSql})`);
+  } catch (error) {
+    if (error.code !== 'ER_DUP_KEYNAME') {
+      throw error;
+    }
+  }
+}
+
 async function createIndexes() {
   const indexes = [
-    'CREATE INDEX IF NOT EXISTS idx_accounts_is_current ON accounts (is_current)',
-    'CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts (status)',
-    'CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs (created_at)',
-    'CREATE INDEX IF NOT EXISTS idx_logs_level ON logs (level)',
-    'CREATE INDEX IF NOT EXISTS idx_logs_account_id ON logs (account_id)',
-    'CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks (created_at)',
-    'CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)',
-    'CREATE INDEX IF NOT EXISTS idx_tasks_assigned_account_id ON tasks (assigned_account_id)',
+    ['accounts', 'idx_accounts_is_current', '`is_current`'],
+    ['accounts', 'idx_accounts_status', '`status`'],
+    ['logs', 'idx_logs_created_at', '`created_at`'],
+    ['logs', 'idx_logs_level', '`level`'],
+    ['logs', 'idx_logs_account_id', '`account_id`'],
+    ['tasks', 'idx_tasks_created_at', '`created_at`'],
+    ['tasks', 'idx_tasks_status', '`status`'],
+    ['tasks', 'idx_tasks_assigned_account_id', '`assigned_account_id`'],
   ];
-  for (const sql of indexes) {
-    await pool.query(sql);
+
+  for (const [tableName, indexName, columnsSql] of indexes) {
+    await createIndexIfMissing(tableName, indexName, columnsSql);
   }
 }
 
@@ -230,7 +254,6 @@ async function seedSettings() {
 }
 
 async function migrateSettings() {
-  // 为已有数据库添加新字段（不影响新安装）
   const migrations = [
     "ALTER TABLE settings ADD COLUMN auto_token_refresh BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE settings ADD COLUMN token_refresh_interval_hours INT NOT NULL DEFAULT 72",
@@ -241,13 +264,27 @@ async function migrateSettings() {
   }
 }
 
+async function normalizeCliPathsForWindows() {
+  if (process.platform !== 'win32') {
+    return;
+  }
+
+  await pool.execute(
+    `UPDATE settings
+     SET codex_path = CASE WHEN codex_path = '/usr/local/bin/codex' THEN '' ELSE codex_path END,
+         trae_path = CASE WHEN trae_path = '/usr/local/bin/trae' THEN '' ELSE trae_path END,
+         updated_at = NOW()
+     WHERE id = 1`,
+  );
+}
+
 export async function initDatabase() {
   await ensureDatabase();
   await createTables();
   await createIndexes();
   await migrateSettings();
+  await normalizeCliPathsForWindows();
 
-  // 仅在非生产环境插入示例数据
   if (process.env.NODE_ENV !== 'production') {
     await seedAccounts();
   }

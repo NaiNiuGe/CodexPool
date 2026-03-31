@@ -20,9 +20,9 @@ export const pool = mysql.createPool({
   ...connectionOptions,
   waitForConnections: true,
   connectionLimit: 10,
-  connectTimeout: 10000,        // 连接超时 10 秒
-  acquireTimeout: 10000,        // 获取连接超时 10 秒
-  idleTimeout: 60000,           // 空闲连接 60 秒后释放
-  enableKeepAlive: true,        // 保持连接活跃
-  keepAliveInitialDelay: 30000, // 30 秒发送第一个 keepalive 包
+  maxIdle: 10,
+  connectTimeout: 10000,
+  idleTimeout: 60000,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 30000,
 });

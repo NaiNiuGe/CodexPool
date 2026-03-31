@@ -98,8 +98,8 @@ export const defaultSettings: PoolSettings = {
   auto_dispatch: true,
   openclaw_endpoint: 'https://api.openclaw.io/v1',
   openclaw_api_key: '',
-  codex_path: '/usr/local/bin/codex',
-  trae_path: '/usr/local/bin/trae',
+  codex_path: '',
+  trae_path: '',
   mode: 'codex',
   auto_launch: false,
 };
